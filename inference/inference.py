@@ -1,111 +1,110 @@
-import torch
-import numpy as np
 import cv2
-import json
-from PIL import Image
-from torchvision import models, transforms
 import torch
+import json
+import os
 import numpy as np
-from sam3.sam3.model_builder import build_sam3_image_model
-from sam3.sam3.model.sam3_image_processor import Sam3Processor
+from ultralytics import YOLO
+from torchvision import transforms
+from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
+from PIL import Image
 
-# ---- Load SAM3 once ----
+# ================= PATHS =================
+PERSON_MODEL = r"D:\LabelySAM\BrandX\models\yolov8n.pt"
+LOGO_MODEL   = r"D:\LabelySAM\BrandX\models\logos_yolo.pt"
+EFF_MODEL    = r"D:\LabelySAM\BrandX\models\brandx_efficientnet.pth"
+CLASSES_JSON = r"D:\LabelySAM\BrandX\models\classes.json"
+IMAGE_PATH   = "adidas.jpg"
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-sam_model = build_sam3_image_model(
-    bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
-    checkpoint_path="sam3_weights/sam3.pt"
-).to(device).eval()
+DEBUG_DIR = "debug_outputs"
+os.makedirs(DEBUG_DIR, exist_ok=True)
 
-processor = Sam3Processor(sam_model)
+def save_debug(name, img):
+    path = os.path.join(DEBUG_DIR, name)
+    cv2.imwrite(path, img)
+    print("Saved:", path)
 
+# ================= LOAD DETECTORS =================
+person_model = YOLO(PERSON_MODEL)
+logo_model   = YOLO(LOGO_MODEL)
 
-def sam3_predict(image_rgb, prompt="logos"):
-    """
-    Runs SAM3 and returns list of binary masks (numpy arrays)
-    """
-    state = processor.set_image(image_rgb)
-
-    outputs = sam_model.predict_inst(
-        state,
-        prompts=[prompt],
-        conf_thresh=0.35
-    )
-
-    masks = outputs["masks"]  # Tensor [N, H, W]
-    return masks.cpu().numpy()
-
-# ===================== CONFIG =====================
-IMAGE_PATH = "test.jpg"
-MODEL_PATH = "labely/brandx/brandx_resnet18.pth"
-CLASS_PATH = "labely/brandx/classes.json"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-# ===================== UTIL =====================
-
-def mask_to_bbox(mask):
-    """Convert binary mask → bounding box"""
-    ys, xs = np.where(mask > 0)
-    if len(xs) == 0 or len(ys) == 0:
-        return None
-    return xs.min(), ys.min(), xs.max(), ys.max()
-
-# ===================== LOAD CLASSES =====================
-
-with open(CLASS_PATH) as f:
+# ================= LOAD CLASSES =================
+with open(CLASSES_JSON) as f:
     classes = json.load(f)
 
-NUM_CLASSES = len(classes)
+# ================= LOAD EFFICIENTNET =================
+clf = efficientnet_b0(weights=EfficientNet_B0_Weights.DEFAULT)
+clf.classifier[1] = torch.nn.Linear(1280, len(classes))
+clf.load_state_dict(torch.load(EFF_MODEL, map_location=device))
+clf.to(device).eval()
 
-# ===================== LOAD CLASSIFIER =====================
-
-model = models.resnet18()
-model.fc = torch.nn.Linear(model.fc.in_features, NUM_CLASSES)
-model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-model.to(DEVICE)
-model.eval()
-
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor()
+# IMPORTANT: normalization for EfficientNet
+tfm = transforms.Compose([
+    transforms.Resize((224,224)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
 ])
 
-# ===================== LOAD IMAGE =====================
-
-image = cv2.imread(IMAGE_PATH)
-image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-# ===================== RUN SAM3 =====================
-
-# YOU must replace this with your SAM3 inference call
-# Expected output: list of binary masks (numpy arrays)
-sam3_masks = sam3_predict(image_rgb, prompt="logos")
-
-# ===================== CLASSIFY REGIONS =====================
-
-for mask in sam3_masks:
-    bbox = mask_to_bbox(mask)
-    if bbox is None:
-        continue
-
-    x1, y1, x2, y2 = bbox
-    crop = image_rgb[y1:y2, x1:x2]
-
-    pil_crop = Image.fromarray(crop)
-    inp = transform(pil_crop).unsqueeze(0).to(DEVICE)
+def classify_logo(crop):
+    rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    pil = Image.fromarray(rgb)
+    x = tfm(pil).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        pred = model(inp).argmax(1).item()
+        out = clf(x)
+        prob = torch.softmax(out,1)
+        conf, pred = prob.max(1)
 
-    label = classes[pred]
+    return classes[pred.item()], conf.item()
 
-    # Draw box + label
-    cv2.rectangle(image, (x1,y1), (x2,y2), (0,255,0), 2)
-    cv2.putText(image, label, (x1, y1-10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+# ================= LOAD IMAGE =================
+pil_img = Image.open(IMAGE_PATH).convert("RGB")
+img = np.array(pil_img)[:, :, ::-1]
 
-# ===================== SHOW RESULT =====================
+# ================= PERSON DETECTION =================
+persons = []
+results = person_model(img, conf=0.4)
 
-cv2.imshow("BrandX Detection", image)
-cv2.waitKey(0)
-cv2.destroyAllWindows()
+for r in results:
+    for box, cls in zip(r.boxes.xyxy.cpu().numpy(), r.boxes.cls.cpu().numpy()):
+        if int(cls) == 0:
+            persons.append(tuple(map(int, box)))
+
+print("Persons found:", len(persons))
+
+# ================= PIPELINE =================
+for pi,(px1,py1,px2,py2) in enumerate(persons):
+    person_crop = img[py1:py2, px1:px2]
+    save_debug(f"person_{pi}.jpg", person_crop)
+
+    logo_results = logo_model(person_crop, conf=0.25)
+
+    for li, r in enumerate(logo_results):
+        for lbox in r.boxes.xyxy.cpu().numpy():
+            lx1,ly1,lx2,ly2 = map(int,lbox)
+            logo_crop = person_crop[ly1:ly2, lx1:lx2]
+
+            if logo_crop.size == 0:
+                continue
+
+            save_debug(f"logo_{pi}_{li}.jpg", logo_crop)
+
+            brand, conf = classify_logo(logo_crop)
+
+            if conf < 0.5:
+                brand = "Unknown"
+
+            print(f"Person {pi}: {brand} ({conf:.2f})")
+
+            display = logo_crop.copy()
+            cv2.putText(display, f"{brand} {conf:.2f}",
+                        (5,20), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6, (0,255,0), 2)
+
+            save_debug(f"classified_{pi}_{li}.jpg", display)
+
+print("Done.")
