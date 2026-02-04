@@ -1,0 +1,24 @@
+# Datasets
+dataset/
+data/
+
+# Images
+*.jpg
+*.png
+*.xml
+
+# Models
+models/
+*.pth
+*.pt
+checkpoints/
+runs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
